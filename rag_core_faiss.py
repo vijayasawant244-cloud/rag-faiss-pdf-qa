@@ -1,81 +1,223 @@
 import faiss
 import numpy as np
 import torch
-from transformers import AutoTokenizer, AutoModel, AutoModelForSeq2SeqLM
 
-# =========================
-# QUERY REWRITER (FLAN)
-# =========================
+from transformers import (
+    AutoTokenizer,
+    AutoModel,
+    AutoModelForSeq2SeqLM
+)
 
-rewrite_tokenizer = AutoTokenizer.from_pretrained("google/flan-t5-small")
-rewrite_model = AutoModelForSeq2SeqLM.from_pretrained("google/flan-t5-small")
+from chunking import load_and_chunk_file
 
-def rewrite_query(query: str) -> str:
-    prompt = f"Rewrite the question for better semantic search:\n{query}"
-    inputs = rewrite_tokenizer(prompt, return_tensors="pt", truncation=True)
-    outputs = rewrite_model.generate(inputs.input_ids, max_new_tokens=32)
-    return rewrite_tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
 
-# =========================
-# EMBEDDINGS
-# =========================
+# =========================================================
+# 1. EMBEDDING MODEL - MiniLM
+# =========================================================
+
+EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 
 embed_tokenizer = AutoTokenizer.from_pretrained(
-    "sentence-transformers/all-MiniLM-L6-v2"
-)
-embed_model = AutoModel.from_pretrained(
-    "sentence-transformers/all-MiniLM-L6-v2"
+    EMBEDDING_MODEL
 )
 
-def get_embedding(text: str) -> np.ndarray:
-    inputs = embed_tokenizer(text, return_tensors="pt", truncation=True)
+embed_model = AutoModel.from_pretrained(
+    EMBEDDING_MODEL
+)
+
+
+def get_embedding(text: str):
+    inputs = embed_tokenizer(
+        text,
+        return_tensors="pt",
+        truncation=True,
+        max_length=512
+    )
+
     with torch.no_grad():
         outputs = embed_model(**inputs)
-    emb = outputs.last_hidden_state.mean(dim=1)
-    return emb[0].numpy().astype("float32")
 
-# =========================
-# LOAD DATA
-# =========================
+    # Mean pooling
+    embedding = outputs.last_hidden_state.mean(dim=1)
 
-with open("data.txt", "r", encoding="utf-8") as f:
-    CHUNKS = [line.strip() for line in f if line.strip()]
+    return embedding[0].numpy().astype("float32")
 
-embeddings = np.vstack([get_embedding(c) for c in CHUNKS])
 
-# =========================
-# FAISS INDEX
-# =========================
+# =========================================================
+# 2. LOAD PDF + CHUNKS
+# =========================================================
+
+CHUNKS = load_and_chunk_file(
+    "documents/company.pdf"
+)
+
+print("Total chunks:", len(CHUNKS))
+
+
+# =========================================================
+# 3. CREATE EMBEDDINGS
+# =========================================================
+
+embeddings = np.vstack([
+    get_embedding(chunk)
+    for chunk in CHUNKS
+])
+
+
+# =========================================================
+# 4. NORMALIZE EMBEDDINGS
+# =========================================================
+
+embeddings = embeddings / np.linalg.norm(
+    embeddings,
+    axis=1,
+    keepdims=True
+)
+
+
+# =========================================================
+# 5. FAISS VECTOR SEARCH
+# =========================================================
 
 dimension = embeddings.shape[1]
-index = faiss.IndexFlatL2(dimension)   # L2 distance
+
+index = faiss.IndexFlatIP(dimension)
+
 index.add(embeddings)
 
-# =========================
-# GENERATION MODEL
-# =========================
 
-gen_tokenizer = AutoTokenizer.from_pretrained("google/flan-t5-small")
-gen_model = AutoModelForSeq2SeqLM.from_pretrained("google/flan-t5-small")
+# =========================================================
+# 6. LLM - QWEN 0.5B
+# =========================================================
 
-# =========================
-# MAIN RAG
-# =========================
+LLM_MODEL = "google/flan-t5-base"
 
-def run_rag(user_query: str) -> str:
-    rewritten = rewrite_query(user_query)
-    query_emb = get_embedding(rewritten).reshape(1, -1)
+gen_tokenizer = AutoTokenizer.from_pretrained(
+    LLM_MODEL
+)
 
-    D, I = index.search(query_emb, k=3)
+gen_model = AutoModelForSeq2SeqLM.from_pretrained(
+    LLM_MODEL
+)
 
-    if D[0][0] > 1.2:   # distance threshold
+
+# =========================================================
+# 7. RAG FUNCTION
+# =========================================================
+
+def is_context_relevant(context: str, user_query: str) -> bool:
+    """
+    Ask the LLM a simple yes/no question:
+    does this context actually contain the answer?
+    This is a separate, easier task than generating the answer itself.
+    """
+
+    check_prompt = f"""Context:
+{context}
+
+Question: {user_query}
+
+Does the context above explicitly contain the answer to this question? Answer with only one word: Yes or No.
+
+Answer:"""
+
+    inputs = gen_tokenizer(
+        check_prompt,
+        return_tensors="pt",
+        truncation=True,
+        max_length=2048
+    )
+
+    with torch.no_grad():
+        outputs = gen_model.generate(
+            **inputs,
+            max_new_tokens=5,
+            do_sample=False
+        )
+
+    verdict = gen_tokenizer.decode(
+        outputs[0],
+        skip_special_tokens=True
+    ).strip().lower()
+
+    print("Relevance check verdict:", verdict)
+
+    return verdict.startswith("yes")
+
+
+def run_rag(user_query: str):
+
+    # -----------------------------------------------------
+    # Query → embedding
+    # -----------------------------------------------------
+
+    query_emb = get_embedding(
+        user_query
+    ).reshape(1, -1)
+
+    query_emb = query_emb / np.linalg.norm(
+        query_emb,
+        axis=1,
+        keepdims=True
+    )
+
+    # -----------------------------------------------------
+    # Search relevant chunks
+    # -----------------------------------------------------
+
+    D, I = index.search(
+        query_emb,
+        k=min(3, len(CHUNKS))
+    )
+
+    similarity_score = float(D[0][0])
+
+    print("Similarity:", similarity_score)
+
+    # -----------------------------------------------------
+    # Relevance threshold (cheap first filter)
+    # -----------------------------------------------------
+
+    if similarity_score < 0.20:
         return "I don't know based on the given data."
 
-    context = "\n".join(f"- {CHUNKS[i]}" for i in I[0])
+    # -----------------------------------------------------
+    # Retrieve context
+    # -----------------------------------------------------
+
+    context = "\n".join(
+        f"- {CHUNKS[i]}"
+        for i in I[0]
+    )
+
+    print("Retrieved context:")
+    print(context)
+
+    # -----------------------------------------------------
+    # Relevance check (second, stronger filter)
+    # -----------------------------------------------------
+
+    if not is_context_relevant(context, user_query):
+        return "I don't know based on the given data."
+
+    # -----------------------------------------------------
+    # Prompt
+    # -----------------------------------------------------
 
     prompt = f"""
-Answer the question using ONLY the context below.
-If the answer is not present, say you don't know.
+You are a helpful document question-answering assistant.
+
+Answer the question using ONLY the provided context.
+
+Rules:
+- Use only facts explicitly present in the context.
+- Do not use outside knowledge.
+- Do not guess or invent information.
+- Answer the exact question asked.
+- Do not add unrelated details.
+- Give a complete but concise answer.
+- If the answer is not present in the context, say exactly:
+I don't know based on the given data.
 
 Context:
 {context}
@@ -85,8 +227,65 @@ Question:
 
 Answer:
 """
+    # -----------------------------------------------------
+    # Generate answer
+    # -----------------------------------------------------
 
-    inputs = gen_tokenizer(prompt, return_tensors="pt")
-    outputs = gen_model.generate(inputs.input_ids, max_new_tokens=80)
+    inputs = gen_tokenizer(
+        prompt,
+        return_tensors="pt",
+        truncation=True,
+        max_length=2048
+    )
 
-    return gen_tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
+    with torch.no_grad():
+        outputs = gen_model.generate(
+        **inputs,
+        max_new_tokens=20,
+        do_sample=False
+    )
+
+    # Decode only newly generated tokens
+    answer = gen_tokenizer.decode(
+    outputs[0],
+    skip_special_tokens=True
+    ).strip()
+
+    if not answer:
+        return "I don't know based on the given data."
+
+    return answer
+
+
+# =========================================================
+# 8. GET RELEVANT CONTEXT
+# =========================================================
+
+def get_relevant_context(user_query: str):
+
+    query_emb = get_embedding(
+        user_query
+    ).reshape(1, -1)
+
+    query_emb = query_emb / np.linalg.norm(
+        query_emb,
+        axis=1,
+        keepdims=True
+    )
+
+    D, I = index.search(
+        query_emb,
+        k=min(3, len(CHUNKS))
+    )
+
+    score = float(D[0][0])
+
+    if score < 0.20:
+        return "I don't know based on the given data.", score
+
+    context = "\n".join(
+        CHUNKS[i]
+        for i in I[0]
+    )
+
+    return context, score

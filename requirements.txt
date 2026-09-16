@@ -1,7 +1,8 @@
-fastapi
-uvicorn
-torch
-transformers
-numpy
-faiss-cpu
-sentence-transformers
+fastapi==0.141.1
+uvicorn==0.52.1
+pydantic==2.13.4
+torch==2.9.1
+transformers==5.15.1
+faiss-cpu==1.15.0
+numpy==2.5.2
+PyPDF2==3.0.1
